@@ -1,9 +1,18 @@
 package com.example.sepetapp
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
+import android.util.Size
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -12,17 +21,24 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.ShoppingCart
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.example.sepetapp.ui.theme.SepetAppTheme
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.common.InputImage
+import java.util.concurrent.Executors
 
 // --- Data Models ---
 enum class SepetDurumu {
@@ -65,9 +81,12 @@ fun SepetAppNavigator(sepetler: MutableMap<String, Sepet>) {
 
     AnimatedContent(targetState = seciliSepetId, label = "navigation") { targetId ->
         if (targetId == null) {
-            AramaEkrani(
-                onSepetBulundu = { id -> seciliSepetId = id },
-                sepetler = sepetler
+            QrCodeScannerScreen(
+                onSepetBulundu = { id ->
+                    if (sepetler.containsKey(id)) {
+                        seciliSepetId = id
+                    }
+                }
             )
         } else {
             val sepet = sepetler[targetId]!!
@@ -89,65 +108,118 @@ fun SepetAppNavigator(sepetler: MutableMap<String, Sepet>) {
     }
 }
 
-// --- Screens ---
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun AramaEkrani(
-    onSepetBulundu: (String) -> Unit,
-    sepetler: Map<String, Sepet>
-) {
-    var sepetKoduInput by remember { mutableStateOf("") }
-    var hataMesaji by remember { mutableStateOf<String?>(null) }
+// --- QR Code Scanner ---
+class QrCodeAnalyzer(
+    private val onQrCodeScanned: (String) -> Unit
+) : ImageAnalysis.Analyzer {
+    private val options = BarcodeScannerOptions.Builder()
+        .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+        .build()
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        Text("Sepet Bul", style = MaterialTheme.typography.headlineMedium)
-        Spacer(modifier = Modifier.height(24.dp))
+    private val scanner = BarcodeScanning.getClient(options)
 
-        OutlinedTextField(
-            value = sepetKoduInput,
-            onValueChange = {
-                sepetKoduInput = it
-                hataMesaji = null
-            },
-            label = { Text("Sepet Kodunu Girin") },
-            leadingIcon = { Icon(Icons.Default.ShoppingCart, contentDescription = "Sepet Kodu")},
-            singleLine = true,
-            isError = hataMesaji != null
-        )
-
-        hataMesaji?.let {
-            Text(
-                text = it,
-                color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodySmall,
-                modifier = Modifier.padding(start = 16.dp, top = 4.dp)
-            )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        Button(
-            onClick = {
-                val girilenKod = sepetKoduInput.trim().uppercase()
-                if (sepetler.containsKey(girilenKod)) {
-                    onSepetBulundu(girilenKod)
-                } else {
-                    hataMesaji = "Geçersiz veya bulunamayan sepet kodu."
+    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+    override fun analyze(imageProxy: androidx.camera.core.ImageProxy) {
+        imageProxy.image?.let { image ->
+            val inputImage = InputImage.fromMediaImage(image, imageProxy.imageInfo.rotationDegrees)
+            scanner.process(inputImage)
+                .addOnSuccessListener { barcodes ->
+                    barcodes.firstOrNull()?.rawValue?.let { qrCode ->
+                        onQrCodeScanned(qrCode)
+                    }
                 }
-            },
-            enabled = sepetKoduInput.isNotBlank()
-        ) {
-            Text("Sepeti Göster")
+                .addOnCompleteListener {
+                    imageProxy.close()
+                }
         }
     }
 }
 
+@Composable
+fun QrCodeScannerScreen(onSepetBulundu: (String) -> Unit) {
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val cameraProviderFuture = remember { ProcessCameraProvider.getInstance(context) }
+    var hasCameraPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.CAMERA
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val launcher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            hasCameraPermission = granted
+        }
+    )
+
+    LaunchedEffect(key1 = true) {
+        if (!hasCameraPermission) {
+            launcher.launch(Manifest.permission.CAMERA)
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        if (hasCameraPermission) {
+            AndroidView(
+                factory = { context ->
+                    val previewView = PreviewView(context)
+                    val preview = Preview.Builder().build()
+                    val selector = CameraSelector.Builder()
+                        .requireLensFacing(CameraSelector.LENS_FACING_BACK)
+                        .build()
+                    preview.setSurfaceProvider(previewView.surfaceProvider)
+                    val imageAnalysis = ImageAnalysis.Builder()
+                        .setTargetResolution(Size(previewView.width, previewView.height))
+                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                        .build()
+                    imageAnalysis.setAnalyzer(
+                        Executors.newSingleThreadExecutor(),
+                        QrCodeAnalyzer { result ->
+                            onSepetBulundu(result)
+                        }
+                    )
+                    try {
+                        cameraProviderFuture.get().bindToLifecycle(
+                            lifecycleOwner,
+                            selector,
+                            preview,
+                            imageAnalysis
+                        )
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                    previewView
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+        } else {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = "Lütfen kamera iznini verin.",
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+        Text(
+            text = "Lütfen sepetin QR kodunu okutun.",
+            style = MaterialTheme.typography.titleLarge,
+            color = Color.White,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier
+                .align(Alignment.TopCenter)
+                .padding(16.dp)
+        )
+    }
+}
+
+
+// --- Detail Screen ---
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun DetayEkrani(
@@ -277,7 +349,9 @@ fun UrunSatiri(urun: String, onUrunSil: () -> Unit) {
 @Composable
 fun AramaEkraniPreview() {
     SepetAppTheme {
-        AramaEkrani(onSepetBulundu = {}, sepetler = mapOf())
+       Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+           Text("QR Code Scanner will be here.")
+       }
     }
 }
 
